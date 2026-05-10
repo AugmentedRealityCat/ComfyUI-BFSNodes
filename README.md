@@ -1,8 +1,6 @@
 # ComfyUI-BFSNodes
 
-Custom ComfyUI nodes by BFS / Alisson Anjos.
-
-This repository includes general video composition helpers and the **LTXV Edit Anything** nodes required by Edit Anything LoRAs trained for LTX-Video 2.3 style `video_to_video_ref_adaln` workflows.
+This repository includes general video composition helpers and the **LTXV Edit Anything** nodes required by Edit Anything LoRAs trained for LTX-Video 2.3 style `video_to_video_ref_adaln` workflows. The first public reference LoRA is expected to be `edit_anything_reference_v0.1_r128_12000.safetensors`.
 
 ## Nodes
 
@@ -61,7 +59,7 @@ ComfyUI/models/loras/
 Subfolders are supported by ComfyUI, so organized paths such as this are fine:
 
 ```text
-ComfyUI/models/loras/ltx-2/2.3/edit_anything/your_lora.safetensors
+ComfyUI/models/loras/ltx-2/2.3/edit_anything/edit_anything_reference_v0.1_r128_12000.safetensors
 ```
 
 ## Basic Workflow
