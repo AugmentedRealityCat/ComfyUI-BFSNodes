@@ -1,7 +1,7 @@
 [project]
 name = "bfsnodes"
 description = "Custom ComfyUI nodes including LTXV Edit Anything conditioning helpers."
-version = "1.2.0"
+version = "1.2.1"
 license = {file = "LICENSE"} 
 dependencies = [
     "torch",
@@ -39,4 +39,3 @@ DisplayName = "ComfyUI-BFSNodes"
 Icon = ""
 includes = [] 
 # "requires-comfyui" = ">=1.0.0"  # ComfyUI version compatibility
-
