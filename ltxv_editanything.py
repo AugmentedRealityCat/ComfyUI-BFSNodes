@@ -50,12 +50,7 @@ def _split_editanything_lora_state_dict(sd):
 
 
 def _filter_editanything_lora_for_standard_loader(sd):
-    """Remove Edit Anything side-channel weights before ComfyUI's LoRA merger.
-
-    The Apply node reads these weights from the original checkpoint. Passing them
-    through the standard LoRA loader can make ComfyUI try to reshape AdaLN LoRA
-    matrices against a different LTXV variant and print shape errors.
-    """
+    """Remove Edit Anything side-channel weights before ComfyUI's LoRA merger."""
     filtered, module = _split_editanything_lora_state_dict(sd)
     return filtered, list(module.keys())
 
@@ -91,9 +86,7 @@ class LTXVEditAnythingSplitLora:
         if not overwrite:
             for path in (standard_path, module_path):
                 if os.path.exists(path):
-                    raise FileExistsError(
-                        f"{path} already exists. Enable overwrite to regenerate it."
-                    )
+                    raise FileExistsError(f"{path} already exists. Enable overwrite to regenerate it.")
 
         save_file(standard, standard_path)
         save_file(module, module_path)
@@ -135,11 +128,7 @@ class LTXVEditAnythingModuleLoader:
 
 
 class LTXVEditAnythingLoraLoader:
-    """LoRA loader for Edit Anything checkpoints.
-
-    Use this instead of the standard ComfyUI LoRA loader for LoRAs trained with
-    the video_to_video_ref_adaln/Edit Anything strategy.
-    """
+    """LoRA loader for Edit Anything checkpoints."""
 
     def __init__(self):
         self.loaded_lora = None
@@ -266,6 +255,11 @@ def _role_inject_tokens(x, additional_args, role_weight, app_latents, strength):
 def _ea_video_process_input(self, x, keyframe_idxs, denoise_mask, kwargs):
     from comfy.ldm.lightricks.model import latent_to_pixel_coords
 
+    _EA_PATCH_COUNTERS["process_input_calls"] += 1
+    _EA_PATCH_COUNTERS["process_input_saw_kwargs_keys"].update(kwargs.keys() if kwargs else [])
+    if kwargs and _KW_ROLE_WEIGHT in kwargs and kwargs[_KW_ROLE_WEIGHT] is not None:
+        _EA_PATCH_COUNTERS["process_input_saw_role"] += 1
+
     additional_args = {"orig_shape": list(x.shape)}
     x, latent_coords = self.patchifier.patchify(x)
     pixel_coords = latent_to_pixel_coords(
@@ -388,6 +382,10 @@ def _patch_prepare_timestep_once(ltxv_model):
     original = ltxv_model._prepare_timestep
 
     def patched(self, timestep, batch_size, hidden_dtype, **kwargs):
+        _EA_PATCH_COUNTERS["prepare_timestep_calls"] += 1
+        _EA_PATCH_COUNTERS["prepare_timestep_saw_kwargs_keys"].update(kwargs.keys() if kwargs else [])
+        if kwargs and _KW_ADALN_COND in kwargs and kwargs[_KW_ADALN_COND] is not None:
+            _EA_PATCH_COUNTERS["prepare_timestep_saw_adaln"] += 1
         t, emb_t, prompt_t = original(timestep, batch_size, hidden_dtype, **kwargs)
         ref_cond = kwargs.get(_KW_ADALN_COND)
         if ref_cond is not None:
@@ -424,6 +422,30 @@ def _patch_prepare_timestep_once(ltxv_model):
     logger.info("EA prepare_timestep patch installed on %s", type(ltxv_model).__name__)
 
 
+def _build_ref_projector_input(ref_lat, in_features):
+    """Build the reference descriptor expected by the trained projector."""
+    B = ref_lat.shape[0]
+    ref_frame = ref_lat.float().mean(dim=2)  # [B, 128, H, W]
+
+    avg_1x1 = F.adaptive_avg_pool2d(ref_frame, (1, 1)).reshape(B, -1)
+    if in_features == 128:
+        return avg_1x1
+
+    max_1x1 = F.adaptive_max_pool2d(ref_frame, (1, 1)).reshape(B, -1)
+    if in_features == 256:
+        return torch.cat([avg_1x1, max_1x1], dim=-1)
+
+    avg_2x2 = F.adaptive_avg_pool2d(ref_frame, (2, 2)).reshape(B, -1)
+    ref_global = torch.cat([avg_1x1, avg_2x2, max_1x1], dim=-1)
+    if in_features == ref_global.shape[-1]:
+        return ref_global
+
+    raise ValueError(
+        f"Unsupported ref projector input dim {in_features}. "
+        "Expected one of 128, 256, or 768."
+    )
+
+
 # ---------------------------------------------------------------------------
 # LTXVEditAnythingApply — the one node to rule them all
 # ---------------------------------------------------------------------------
@@ -444,7 +466,8 @@ class LTXVEditAnythingApply:
         via self-attention.
 
     ③ AdaLN conditioning  (ref_adaln_proj: fc1 → SiLU → proj)
-        Pools the ref image latent (mean + max → 256-dim), projects through a
+        Pools the ref image latent using the projector shape saved in the LoRA,
+        projects through a
         2-layer MLP to the AdaLN timestep space, and adds it to every
         transformer block's timestep bias — a persistent global appearance anchor.
 
@@ -467,11 +490,11 @@ class LTXVEditAnythingApply:
                     "default": "pad_to_fit",
                     "tooltip": "How to resize the reference image to match the video's resolution. 'pad_to_fit' avoids distortion.",
                 }),
+                "lora_name": (folder_paths.get_filename_list("loras"), {
+                    "tooltip": "LoRA trained with the video_to_video_ref_adaln strategy.",
+                }),
             },
             "optional": {
-                "editanything_module": ("LTXV_EA_MODULE", {
-                    "tooltip": "Optional sidecar module loaded by LTXV Edit Anything Module Loader. If disconnected, role embedding and AdaLN conditioning are skipped.",
-                }),
                 "guide_frames": ("IMAGE", {
                     "tooltip": "Guide video frames for structure/motion. "
                                "Leave disconnected for appearance-only (no guide).",
@@ -492,17 +515,19 @@ class LTXVEditAnythingApply:
                                "Helps Attention find the reference in the latent space. Increase if the model ignores the reference.",
                 }),
                 "adaln_scale": ("FLOAT", {
-                    "default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05,
-                    "tooltip": "Global Style Bias Multiplier (AdaLN). Sets the weight of global colors/textures. "
-                               "Start around 1.0 unless the checkpoint was trained with a different ref_cond_scale.",
+                    "default": 2.0, "min": 0.0, "max": 10.0, "step": 0.05,
+                    "tooltip": "Global Style Bias Multiplier (AdaLN). Must match training "
+                               "`ref_cond_scale`. stage2_ref_visual_adaln_crossattn was trained with 2.0.",
                 }),
                 "enable_adaln": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "Inject global style anchor (AdaLN). Toggle off to see only shape transfer via IC-LoRA (Self-Attention).",
                 }),
                 "enable_role_embedding": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Inject identifying tag into ref image. Toggle off to test if the model suffers from Modality Collapse and finds the reference unassisted.",
+                    "default": False,
+                    "tooltip": "Sum role_embedding bias onto IC-LoRA ref tokens. Must match training "
+                               "`use_visual_ref_role_embedding`. stage2_ref_visual_adaln_crossattn "
+                               "was trained with this DISABLED.",
                 }),
                 "debug": ("BOOLEAN", {
                     "default": False,
@@ -517,15 +542,15 @@ class LTXVEditAnythingApply:
     CATEGORY = "LTXV/EditAnything"
 
     def apply(
-        self, model, positive, negative, vae, latent, ref_image, resize_mode="pad_to_fit",
+        self, model, positive, negative, vae, latent, ref_image, lora_name, resize_mode="pad_to_fit",
         guide_frames=None, guide_strength=1.0, ref_strength=1.0,
         role_strength=1.0, adaln_scale=1.0, enable_adaln=True, enable_role_embedding=True, debug=False,
-        editanything_module=None,
     ):
         import comfy.utils
         import comfy_extras.nodes_lt as nodes_lt
 
-        sd = editanything_module["state_dict"] if editanything_module is not None else {}
+        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        sd = load_file(lora_path)
 
         # ── ① Load weights from LoRA ─────────────────────────────────────────
         # Role embedding: new format [N_slots, 128]
@@ -650,17 +675,19 @@ class LTXVEditAnythingApply:
 
         if has_adaln and enable_adaln:
             B = ref_lat.shape[0]
-            flat = ref_lat.reshape(B, 128, -1).float()
-            ref_mean = flat.mean(dim=-1)
-            ref_max  = flat.max(dim=-1).values
             dtype = proj_w.dtype
 
             if has_fc1:
-                ref_global = torch.cat([ref_mean, ref_max], dim=-1).to(dtype=dtype)
+                ref_global = _build_ref_projector_input(ref_lat, fc1_w.shape[1]).to(
+                    dtype=dtype, device=fc1_w.device
+                )
                 h = F.silu(F.linear(ref_global, fc1_w.to(dtype=dtype), fc1_b.to(dtype=dtype)))
                 ref_cond = F.linear(h, proj_w, proj_b)
             else:
-                ref_cond = F.linear(ref_mean.to(dtype=dtype), proj_w, proj_b)
+                ref_global = _build_ref_projector_input(ref_lat, proj_w.shape[1]).to(
+                    dtype=dtype, device=proj_w.device
+                )
+                ref_cond = F.linear(ref_global, proj_w, proj_b)
 
             ref_cond = ref_cond * adaln_scale
             _patch_prepare_timestep_once(ltxv)
@@ -889,20 +916,1299 @@ class LTXVResizeReferenceByMask:
         return (canvas, out_mask)
 
 
+def _ea_loop_resize_ref_image(ref_image, width, height, resize_mode):
+    import comfy.utils
+
+    ref_px = ref_image[0:1, :, :, :3]
+    if resize_mode == "stretch":
+        return comfy.utils.common_upscale(
+            ref_px.movedim(-1, 1), width, height, "bilinear", "disabled"
+        ).movedim(1, -1)[:, :, :, :3]
+    if resize_mode == "center_crop":
+        return comfy.utils.common_upscale(
+            ref_px.movedim(-1, 1), width, height, "bilinear", "center"
+        ).movedim(1, -1)[:, :, :, :3]
+
+    _, src_h, src_w, channels = ref_px.shape
+    scale = min(width / src_w, height / src_h)
+    new_w = max(1, int(src_w * scale))
+    new_h = max(1, int(src_h * scale))
+    resized = torch.nn.functional.interpolate(
+        ref_px.movedim(-1, 1),
+        size=(new_h, new_w),
+        mode="bilinear",
+        align_corners=False,
+    ).movedim(1, -1)
+    canvas = torch.full(
+        (1, height, width, channels),
+        0.5,
+        dtype=ref_px.dtype,
+        device=ref_px.device,
+    )
+    y = (height - new_h) // 2
+    x = (width - new_w) // 2
+    canvas[:, y:y + new_h, x:x + new_w, :] = resized
+    return canvas[:, :, :, :3]
+
+
+def _ea_loop_build_ref_projector_input(ref_lat, in_features):
+    b = ref_lat.shape[0]
+    ref_frame = ref_lat.mean(dim=2)
+    avg_1x1 = F.adaptive_avg_pool2d(ref_frame, (1, 1)).reshape(b, -1)
+    if in_features == avg_1x1.shape[1]:
+        return avg_1x1
+
+    max_1x1 = F.adaptive_max_pool2d(ref_frame, (1, 1)).reshape(b, -1)
+    mean_max = torch.cat([avg_1x1, max_1x1], dim=-1)
+    if in_features == mean_max.shape[1]:
+        return mean_max
+
+    avg_2x2 = F.adaptive_avg_pool2d(ref_frame, (2, 2)).reshape(b, -1)
+    multiscale = torch.cat([avg_1x1, avg_2x2, max_1x1], dim=-1)
+    if in_features == multiscale.shape[1]:
+        return multiscale
+
+    raise ValueError(
+        f"Unsupported ref_adaln_proj input dim {in_features}. "
+        f"Known dims: {avg_1x1.shape[1]}, {mean_max.shape[1]}, {multiscale.shape[1]}."
+    )
+
+
+def _ea_loop_load_state_dict(lora_name, editanything_module):
+    """Load EA weights from a LoRA file or a sidecar module. Returns merged dict (may be empty)."""
+    sd = {}
+    if lora_name is not None and lora_name != "" and lora_name != "(none)":
+        try:
+            lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+            sd.update(load_file(lora_path))
+        except Exception as exc:
+            logger.warning("LTXVEditAnythingLoopingSampler: failed to load lora '%s': %s", lora_name, exc)
+    if editanything_module is not None:
+        mod_sd = editanything_module.get("state_dict") if isinstance(editanything_module, dict) else None
+        if mod_sd is None and isinstance(editanything_module, dict):
+            mod_sd = editanything_module
+        if mod_sd:
+            sd.update(mod_sd)
+    return sd
+
+
+def _ea_loop_extract_role_weight(sd):
+    if "role_embedding.embedding.weight" in sd:
+        emb = sd["role_embedding.embedding.weight"]
+        padded = torch.zeros(3, emb.shape[1], dtype=emb.dtype)
+        padded[1] = emb[0]
+        return padded
+    for k in ("role_embedding.weight", "_role_embedding.weight",
+              "diffusion_model.role_embedding.weight", "diffusion_model._role_embedding.weight"):
+        if k in sd:
+            return sd[k]
+    return None
+
+
+def _ea_loop_compute_adaln_cond(sd, ref_lat, adaln_scale):
+    proj_w = sd.get("ref_adaln_proj.proj.weight")
+    proj_b = sd.get("ref_adaln_proj.proj.bias")
+    fc1_w = sd.get("ref_adaln_proj.fc1.weight")
+    fc1_b = sd.get("ref_adaln_proj.fc1.bias")
+    if proj_w is None or proj_b is None:
+        return None
+    in_features = fc1_w.shape[1] if fc1_w is not None else proj_w.shape[1]
+    dtype = proj_w.dtype
+    ref_global = _ea_loop_build_ref_projector_input(ref_lat, in_features).to(dtype=dtype)
+    if fc1_w is not None and fc1_b is not None:
+        hidden = F.silu(F.linear(ref_global, fc1_w.to(dtype=dtype), fc1_b.to(dtype=dtype)))
+        ref_cond = F.linear(hidden, proj_w, proj_b)
+    else:
+        ref_cond = F.linear(ref_global, proj_w, proj_b)
+    return ref_cond * float(adaln_scale)
+
+
+# ---------------------------------------------------------------------------
+# Visual ref-attn cross-attention path (for stage2_ref_visual_adaln_crossattn checkpoints)
+# Ported from /data/comfyui/custom_nodes/ltxv_ref_visual_lora.py
+# ---------------------------------------------------------------------------
+
+_KW_REF_CONTEXT = "ea_ref_visual_context"
+_KW_REF_SCALE = "ea_ref_visual_scale"
+_KW_REF_START = "ea_ref_visual_start_block"
+_KW_REF_END = "ea_ref_visual_end_block"
+
+
+# Diagnostic counters — incremented inside the monkey-patched methods so we can
+# prove whether transformer_options is actually reaching the model forward.
+_EA_PATCH_COUNTERS = {
+    "process_input_calls": 0,
+    "process_input_saw_role": 0,
+    "process_input_saw_kwargs_keys": set(),
+    "prepare_timestep_calls": 0,
+    "prepare_timestep_saw_adaln": 0,
+    "prepare_timestep_saw_kwargs_keys": set(),
+    "block_forward_calls": 0,
+    "block_forward_saw_ref_ctx": 0,
+    "block_forward_ref_ctx_norm": 0.0,
+}
+
+
+def _ea_reset_counters():
+    _EA_PATCH_COUNTERS["process_input_calls"] = 0
+    _EA_PATCH_COUNTERS["process_input_saw_role"] = 0
+    _EA_PATCH_COUNTERS["process_input_saw_kwargs_keys"] = set()
+    _EA_PATCH_COUNTERS["prepare_timestep_calls"] = 0
+    _EA_PATCH_COUNTERS["prepare_timestep_saw_adaln"] = 0
+    _EA_PATCH_COUNTERS["prepare_timestep_saw_kwargs_keys"] = set()
+    _EA_PATCH_COUNTERS["block_forward_calls"] = 0
+    _EA_PATCH_COUNTERS["block_forward_saw_ref_ctx"] = 0
+    _EA_PATCH_COUNTERS["block_forward_ref_ctx_norm"] = 0.0
+
+
+def _ea_format_counters():
+    c = _EA_PATCH_COUNTERS
+    return (
+        "[EA patch counters]\n"
+        f"  _process_input:    calls={c['process_input_calls']}  "
+        f"saw_role_weight={c['process_input_saw_role']}  "
+        f"kwargs_keys={sorted(c['process_input_saw_kwargs_keys'])}\n"
+        f"  _prepare_timestep: calls={c['prepare_timestep_calls']}  "
+        f"saw_adaln_cond={c['prepare_timestep_saw_adaln']}  "
+        f"kwargs_keys={sorted(c['prepare_timestep_saw_kwargs_keys'])}\n"
+        f"  block.forward:     calls={c['block_forward_calls']}  "
+        f"saw_ref_context={c['block_forward_saw_ref_ctx']}  "
+        f"ref_ctx_norm_sum={c['block_forward_ref_ctx_norm']:.4f}"
+    )
+
+
+def _ea_factorize_tokens(num_tokens):
+    import math as _math
+    h = int(_math.isqrt(num_tokens))
+    while num_tokens % h != 0:
+        h -= 1
+    return h, num_tokens // h
+
+
+def _ea_nested_module(root, path):
+    cur = root
+    for part in path.split("."):
+        cur = cur[int(part)] if part.isdigit() else getattr(cur, part)
+    return cur
+
+
+def _ea_has_ref_visual_keys(sd):
+    return "ref_visual_proj.proj.weight" in sd and "ref_visual_proj.pos_embed" in sd
+
+
+def _ea_has_ref_attn_lora(sd):
+    for k in sd:
+        if ".ref_attn." in k and k.endswith(".lora_A.weight"):
+            return True
+    return False
+
+
+def _ea_build_ref_visual_context(sd, ref_lat, token_scale):
+    required = [
+        "ref_visual_proj.fc1.weight",
+        "ref_visual_proj.fc1.bias",
+        "ref_visual_proj.proj.weight",
+        "ref_visual_proj.proj.bias",
+        "ref_visual_proj.norm.weight",
+        "ref_visual_proj.norm.bias",
+        "ref_visual_proj.pos_embed",
+    ]
+    missing = [k for k in required if k not in sd]
+    if missing:
+        raise ValueError(f"LoRA is missing ref_visual_proj keys: {missing}")
+
+    dtype = sd["ref_visual_proj.proj.weight"].dtype
+    device = ref_lat.device
+    pos = sd["ref_visual_proj.pos_embed"].to(device=device, dtype=dtype)
+    num_tokens = pos.shape[1]
+    grid_h, grid_w = _ea_factorize_tokens(num_tokens)
+
+    ref_frame = ref_lat.to(dtype=dtype).mean(dim=2)
+    local = F.adaptive_avg_pool2d(ref_frame, (grid_h, grid_w)).flatten(2).transpose(1, 2)
+    flat = ref_frame.flatten(2)
+    global_mean = flat.mean(dim=-1)
+    global_std = flat.std(dim=-1, unbiased=False)
+    global_stats = torch.cat([global_mean, global_std], dim=-1)[:, None, :].expand(-1, local.shape[1], -1)
+    tokens = torch.cat([local, global_stats], dim=-1)
+
+    fc1_w = sd["ref_visual_proj.fc1.weight"].to(device=device, dtype=dtype)
+    fc1_b = sd["ref_visual_proj.fc1.bias"].to(device=device, dtype=dtype)
+    proj_w = sd["ref_visual_proj.proj.weight"].to(device=device, dtype=dtype)
+    proj_b = sd["ref_visual_proj.proj.bias"].to(device=device, dtype=dtype)
+    norm_w = sd["ref_visual_proj.norm.weight"].to(device=device, dtype=dtype)
+    norm_b = sd["ref_visual_proj.norm.bias"].to(device=device, dtype=dtype)
+
+    tokens = F.linear(F.silu(F.linear(tokens, fc1_w, fc1_b)), proj_w, proj_b)
+    tokens = F.layer_norm(tokens, (tokens.shape[-1],), norm_w, norm_b)
+    tokens = tokens + pos[:, : tokens.shape[1]]
+    return tokens * float(token_scale)
+
+
+def _ea_install_ref_attn_modules(ltxv, context_dim, init_seed, init_from="attn2"):
+    """Install/reinstall a CrossAttention `ref_attn` on each transformer block.
+
+    Creates the module only once per ltxv instance (heavy: 48 CrossAttention
+    submodules), but ALWAYS resets weights to the chosen base init on every
+    call. This is critical because LoRA deltas are added on top: without a
+    reset, calling apply_ref_attn_lora repeatedly would compound the delta.
+
+    init_from: must match training config `init_ref_attn_from`:
+      "attn2" — copy attn2 weights (training default for visual_adaln_crossattn)
+      "attn1" — copy attn1 weights
+      "none"  — random seeded init + zero out to_out (training only for "none" runs)
+    """
+    from comfy.ldm.lightricks.model import CrossAttention
+    import comfy.ops
+
+    if init_seed is not None and init_seed >= 0:
+        cpu_state = torch.random.get_rng_state()
+        torch.manual_seed(int(init_seed))
+    else:
+        cpu_state = None
+
+    needs_create = not getattr(ltxv, "_ea_ref_visual_modules_installed", False)
+    copied_count = 0
+
+    try:
+        for block in ltxv.transformer_blocks:
+            if needs_create or not hasattr(block, "ref_attn"):
+                dim = block.scale_shift_table.shape[1]
+                dtype = block.scale_shift_table.dtype
+                device = block.scale_shift_table.device
+                heads = block.attn1.heads
+                d_head = block.attn1.dim_head
+                block.ref_attn = CrossAttention(
+                    query_dim=dim,
+                    context_dim=context_dim,
+                    heads=heads,
+                    dim_head=d_head,
+                    attn_precision=getattr(block.attn1, "attn_precision", None),
+                    dtype=dtype,
+                    device=device,
+                    operations=comfy.ops.disable_weight_init,
+                )
+                # disable_weight_init leaves params on meta — materialize and
+                # zero the biases that src (attn1/attn2) won't provide, since
+                # LTX-2 attn has no bias on to_q/to_k/to_v/to_out. Otherwise
+                # load_state_dict below hits meta tensors with no data.
+                if any(p.is_meta for p in block.ref_attn.parameters()):
+                    block.ref_attn = block.ref_attn.to_empty(device=device)
+                    with torch.no_grad():
+                        for sub_name in ("to_q", "to_k", "to_v"):
+                            sub = getattr(block.ref_attn, sub_name, None)
+                            if sub is not None and getattr(sub, "bias", None) is not None:
+                                sub.bias.zero_()
+                        if block.ref_attn.to_out[0].bias is not None:
+                            block.ref_attn.to_out[0].bias.zero_()
+
+            # ALWAYS reset weights to the base init on every call. Cleans up any
+            # previous LoRA delta application from earlier runs.
+            if init_from in ("attn1", "attn2"):
+                src_attn = getattr(block, init_from, None)
+                if src_attn is not None:
+                    src_sd = src_attn.state_dict()
+                    ref_sd = block.ref_attn.state_dict()
+                    # Skip meta tensors — they have no data and load_state_dict raises.
+                    compatible = {
+                        k: v.detach().clone()
+                        for k, v in src_sd.items()
+                        if k in ref_sd
+                        and ref_sd[k].shape == v.shape
+                        and not v.is_meta
+                    }
+                    if compatible:
+                        ref_sd.update(compatible)
+                        block.ref_attn.load_state_dict(ref_sd, strict=False)
+                        copied_count += 1
+            else:
+                # "none": random init for q/k/v under the seed, zero to_out
+                with torch.no_grad():
+                    for sub_name in ("to_q", "to_k", "to_v"):
+                        sub = getattr(block.ref_attn, sub_name, None)
+                        if sub is not None and hasattr(sub, "weight"):
+                            torch.nn.init.xavier_uniform_(sub.weight)
+                            if getattr(sub, "bias", None) is not None:
+                                torch.nn.init.zeros_(sub.bias)
+                    torch.nn.init.zeros_(block.ref_attn.to_out[0].weight)
+                    if block.ref_attn.to_out[0].bias is not None:
+                        torch.nn.init.zeros_(block.ref_attn.to_out[0].bias)
+    finally:
+        if cpu_state is not None:
+            torch.random.set_rng_state(cpu_state)
+
+    logger.info("ref_attn modules: created=%s, weights reset from '%s' on %d/%d blocks",
+                needs_create, init_from, copied_count, len(ltxv.transformer_blocks))
+    ltxv._ea_ref_visual_modules_installed = True
+
+
+def _ea_apply_ref_attn_lora(ltxv, sd, strength):
+    count = 0
+    for key, lora_a in sd.items():
+        if ".ref_attn." not in key or not key.endswith(".lora_A.weight"):
+            continue
+        lora_b_key = key.replace(".lora_A.weight", ".lora_B.weight")
+        if lora_b_key not in sd:
+            continue
+        parts = key.split(".")
+        try:
+            block_idx = int(parts[2])
+            module_path = ".".join(parts[4:-2])
+            module = _ea_nested_module(ltxv.transformer_blocks[block_idx].ref_attn, module_path)
+        except Exception as exc:
+            logger.warning("Could not map ref_attn LoRA key %s: %s", key, exc)
+            continue
+
+        weight = module.weight
+        la = lora_a.to(device=weight.device, dtype=torch.float32)
+        lb = sd[lora_b_key].to(device=weight.device, dtype=torch.float32)
+        delta = (lb @ la).to(dtype=weight.dtype) * float(strength)
+        weight.data.add_(delta)
+        count += 1
+    logger.info("Applied %d ref_attn LoRA deltas", count)
+    return count
+
+
+def _ea_patch_block_forward_once(ltxv):
+    if getattr(ltxv, "_ea_ref_visual_forward_patched", False):
+        return
+
+    import comfy.ldm.common_dit
+
+    for idx, block in enumerate(ltxv.transformer_blocks):
+        original = block.forward
+
+        def patched(self, *args, _idx=idx, _original=original, **kwargs):
+            _EA_PATCH_COUNTERS["block_forward_calls"] += 1
+            transformer_options = kwargs.get("transformer_options") or {}
+            ref_context = transformer_options.get(_KW_REF_CONTEXT)
+            if ref_context is not None:
+                _EA_PATCH_COUNTERS["block_forward_saw_ref_ctx"] += 1
+                try:
+                    _EA_PATCH_COUNTERS["block_forward_ref_ctx_norm"] += float(ref_context.norm().item())
+                except Exception:
+                    pass
+            out = _original(*args, **kwargs)
+            if ref_context is None:
+                return out
+
+            start = transformer_options.get(_KW_REF_START)
+            end = transformer_options.get(_KW_REF_END)
+            use_ref = (start is None or _idx >= int(start)) and (end is None or _idx <= int(end))
+            if not use_ref:
+                return out
+
+            def apply_ref(x):
+                rc = ref_context.to(device=x.device, dtype=x.dtype)
+                if rc.shape[0] < x.shape[0]:
+                    rc = rc.expand(x.shape[0], -1, -1)
+                scale = float(transformer_options.get(_KW_REF_SCALE, 0.05))
+                return x + self.ref_attn(
+                    comfy.ldm.common_dit.rms_norm(x),
+                    context=rc,
+                    transformer_options=transformer_options,
+                ) * scale
+
+            if isinstance(out, tuple):
+                if not out:
+                    return out
+                vx = apply_ref(out[0])
+                return (vx, *out[1:])
+            return apply_ref(out)
+
+        block.forward = types.MethodType(patched, block)
+
+    ltxv._ea_ref_visual_forward_patched = True
+
+
+def _ea_loop_compute_diff_str(prev_latent, prev_config, cur_latent, cur_config):
+    """Return a short multi-line string with diff metrics between two LATENT samples tensors."""
+    import math
+    a = prev_latent.detach().float().cpu()
+    b = cur_latent.detach().float().cpu()
+    if a.shape != b.shape:
+        slices = tuple(slice(0, min(da, db)) for da, db in zip(a.shape, b.shape))
+        a = a[slices]
+        b = b[slices]
+    diff = a - b
+    mse = (diff.pow(2)).mean().item()
+    rmse = math.sqrt(mse) if mse > 0 else 0.0
+    l1 = diff.abs().mean().item()
+    max_abs = diff.abs().max().item()
+    peak = max(a.abs().max().item(), b.abs().max().item(), 1e-8)
+    psnr = 20.0 * math.log10(peak / rmse) if rmse > 0 else float("inf")
+    af = a.flatten()
+    bf = b.flatten()
+    cos = ((af * bf).sum() / (af.norm() * bf.norm()).clamp_min(1e-8)).item()
+    identical = bool(torch.equal(a, b))
+
+    # build per-toggle diff line
+    diff_keys = []
+    if prev_config and cur_config:
+        for k in sorted(set(prev_config.keys()) | set(cur_config.keys())):
+            pv = prev_config.get(k)
+            cv = cur_config.get(k)
+            if pv != cv:
+                diff_keys.append(f"{k}: {pv} → {cv}")
+    cfg_diff = "; ".join(diff_keys) if diff_keys else "(no toggle changes detected)"
+
+    return "\n".join([
+        f"[LoopingSampler diff vs previous run]",
+        f"  toggle changes: {cfg_diff}",
+        f"  identical_bitwise = {identical}",
+        f"  MSE     = {mse:.6e}",
+        f"  RMSE    = {rmse:.6e}",
+        f"  L1_mean = {l1:.6e}",
+        f"  MaxAbs  = {max_abs:.6e}",
+        f"  PSNR    = {psnr:.2f} dB",
+        f"  Cosine  = {cos:.6f}",
+    ])
+
+
+class LTXVEditAnythingLoopingSampler:
+    """Temporal looping sampler with full Edit Anything conditioning per chunk.
+
+    Mirrors LTXVEditAnythingApply but slices the video temporally and re-applies
+    ref+guide IC-LoRA tokens (via LTXVAddGuide.append_keyframe), role embedding,
+    and AdaLN per chunk. Each chunk gets its own slice of the guide video.
+
+    Inputs are explicit positive/negative CONDITIONING; the GUIDER input provides
+    only the sampling machinery (CFG/STG params) and its conds are overridden
+    per chunk via guider.set_conds.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "vae": ("VAE",),
+                "noise": ("NOISE",),
+                "sampler": ("SAMPLER",),
+                "sigmas": ("SIGMAS",),
+                "guider": ("GUIDER", {
+                    "tooltip": "Provides CFG/STG sampling settings. Its conds are overridden per chunk.",
+                }),
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "latents": ("LATENT",),
+                "temporal_tile_size": ("INT", {
+                    "default": 80, "min": 8, "max": 1000, "step": 8,
+                    "tooltip": "Temporal tile size in pixel frames.",
+                }),
+                "temporal_overlap": ("INT", {
+                    "default": 24, "min": 0, "max": 256, "step": 8,
+                    "tooltip": "Temporal overlap in pixel frames.",
+                }),
+                "blend_overlap": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "lora_name": (["(none)"] + folder_paths.get_filename_list("loras"), {
+                    "default": "(none)",
+                    "tooltip": "Edit Anything LoRA. Used to load role_embedding + ref_adaln_proj weights. "
+                               "Leave on (none) if passing editanything_module instead.",
+                }),
+                "editanything_module": ("LTXV_EA_MODULE", {
+                    "tooltip": "Alternative to lora_name: sidecar module from LTXV Edit Anything Module Loader.",
+                }),
+                "ref_image": ("IMAGE", {
+                    "tooltip": "Reference image (appearance anchor). Required for IC-LoRA ref tokens / AdaLN.",
+                }),
+                "guide_frames": ("IMAGE", {
+                    "tooltip": "Guide video frames (structure/motion). VAE-encoded internally, then sliced per chunk.",
+                }),
+                "ref_resize_mode": (["pad_to_fit", "center_crop", "stretch"], {"default": "pad_to_fit"}),
+                "ref_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "guide_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "role_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 20.0, "step": 0.1}),
+                "adaln_scale": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 10.0, "step": 0.05}),
+                "enable_ic_lora": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Append ref + guide_slice as IC-LoRA clean tokens per chunk.",
+                }),
+                "enable_role_embedding": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Sum role_embedding bias onto IC-LoRA ref tokens. Must match training "
+                               "config `use_visual_ref_role_embedding`. stage2_ref_visual_adaln_crossattn "
+                               "was trained with this DISABLED.",
+                }),
+                "enable_adaln": ("BOOLEAN", {"default": True}),
+                "reapply_per_chunk": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "If True: append ref + (sliced) guide tokens on every chunk. "
+                               "If False: only on chunk 0; later chunks inherit no IC-LoRA append.",
+                }),
+                "enable_visual_crossattn": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Auto-detect ref_visual_proj + ref_attn LoRA keys in the checkpoint "
+                               "and enable the visual cross-attention path (stage2_ref_visual_adaln_crossattn).",
+                }),
+                "ref_context_scale": ("FLOAT", {
+                    "default": 0.01, "min": 0.0, "max": 2.0, "step": 0.01,
+                    "tooltip": "Scale for ref_attn output added to each block. Training default for "
+                               "video_to_video_ref_visual_adaln is 0.01 (very conservative).",
+                }),
+                "ref_token_scale": ("FLOAT", {
+                    "default": 0.25, "min": 0.0, "max": 2.0, "step": 0.01,
+                    "tooltip": "Scale applied to projected visual memory tokens before cross-attn. "
+                               "stage2_ref_visual_adaln_crossattn was trained with 0.25.",
+                }),
+                "ref_start_block": ("INT", {
+                    "default": 12, "min": 0, "max": 47, "step": 1,
+                    "tooltip": "First transformer block that consumes visual ref tokens "
+                               "(training default 12).",
+                }),
+                "ref_end_block": ("INT", {
+                    "default": 35, "min": 0, "max": 47, "step": 1,
+                    "tooltip": "Last transformer block that consumes visual ref tokens (training default 35).",
+                }),
+                "ref_init_from": (["attn2", "attn1", "none"], {
+                    "default": "attn2",
+                    "tooltip": "How to initialize ref_attn before applying its LoRA. "
+                               "CRITICAL: must match the training config `init_ref_attn_from`. "
+                               "stage2_ref_visual_adaln_crossattn was trained with 'attn2'.",
+                }),
+                "ref_init_seed": ("INT", {
+                    "default": 42, "min": -1, "max": 2147483647, "step": 1,
+                    "tooltip": "Seed for random ref_attn init when ref_init_from='none'. Ignored otherwise.",
+                }),
+                "ref_attn_lora_strength": ("FLOAT", {
+                    "default": 1.0, "min": -2.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "Strength multiplier for the ref_attn LoRA deltas.",
+                }),
+                "debug_ea": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT", "IMAGE", "STRING")
+    RETURN_NAMES = ("denoised_output", "ref_image_preview", "diff_vs_previous_run")
+    FUNCTION = "sample"
+    CATEGORY = "LTXV/EditAnything"
+
+    # Class-level state: stores the previous run's output for in-node A/B diff.
+    # Persists across ComfyUI executions within the same Python process.
+    _LAST_RUN_LATENT = None
+    _LAST_RUN_CONFIG = None
+
+    # ---- helpers ----
+
+    @staticmethod
+    def _encode_ref(vae, ref_image, px_w, px_h, ref_resize_mode):
+        ref_px = _ea_loop_resize_ref_image(ref_image, px_w, px_h, ref_resize_mode)
+        return ref_px, vae.encode(ref_px)
+
+    @staticmethod
+    def _encode_guide(vae, guide_frames, px_w, px_h, time_sf):
+        import comfy.utils
+        gf = comfy.utils.common_upscale(
+            guide_frames.movedim(-1, 1), px_w, px_h, "bilinear", "disabled"
+        ).movedim(1, -1)[:, :, :, :3]
+        n_guide = (gf.shape[0] - 1) // time_sf * time_sf + 1
+        return vae.encode(gf[:n_guide])
+
+    @staticmethod
+    def _slice_guide_lat(guide_lat, start_lat, end_lat):
+        if guide_lat is None:
+            return None
+        F_guide = guide_lat.shape[2]
+        s = max(0, min(start_lat, F_guide))
+        e = max(s, min(end_lat, F_guide))
+        if e <= s:
+            return None
+        return guide_lat[:, :, s:e, :, :].contiguous()
+
+    @staticmethod
+    def _build_chunk_conds(
+        positive, negative, chunk_latent, chunk_mask,
+        ref_lat, guide_chunk_lat, scale_factors,
+        ref_strength, guide_strength, enable_ic_lora,
+    ):
+        """Append ref + guide_chunk to chunk's positive/negative; return updated tuple."""
+        import comfy_extras.nodes_lt as nodes_lt
+        if not enable_ic_lora or (ref_lat is None and guide_chunk_lat is None):
+            return positive, negative, chunk_latent, chunk_mask, 0
+
+        time_sf = scale_factors[0]
+        appended_latent_frames = 0
+
+        # entry[0] = ref @ t=-time_sf (appearance), training layout
+        if ref_lat is not None:
+            positive, negative, chunk_latent, chunk_mask = nodes_lt.LTXVAddGuide.append_keyframe(
+                positive, negative, -time_sf, chunk_latent, chunk_mask,
+                ref_lat, ref_strength, scale_factors, causal_fix=True,
+            )
+            positive, negative = nodes_lt._append_guide_attention_entry(
+                positive, negative,
+                ref_lat.shape[2] * ref_lat.shape[3] * ref_lat.shape[4],
+                list(ref_lat.shape[2:]),
+                strength=ref_strength,
+            )
+            appended_latent_frames += ref_lat.shape[2]
+
+        # entry[1] = guide_chunk @ frame 0 of this chunk (motion)
+        if guide_chunk_lat is not None:
+            positive, negative, chunk_latent, chunk_mask = nodes_lt.LTXVAddGuide.append_keyframe(
+                positive, negative, 0, chunk_latent, chunk_mask,
+                guide_chunk_lat, guide_strength, scale_factors, causal_fix=True,
+            )
+            positive, negative = nodes_lt._append_guide_attention_entry(
+                positive, negative,
+                guide_chunk_lat.shape[2] * guide_chunk_lat.shape[3] * guide_chunk_lat.shape[4],
+                list(guide_chunk_lat.shape[2:]),
+                strength=guide_strength,
+            )
+            appended_latent_frames += guide_chunk_lat.shape[2]
+
+        return positive, negative, chunk_latent, chunk_mask, appended_latent_frames
+
+    @staticmethod
+    def _patch_chunk_model(
+        model, role_weight, adaln_cond, role_strength,
+        enable_role_embedding, enable_adaln,
+        ref_context=None, ref_context_scale=0.05,
+        ref_start_block=None, ref_end_block=None,
+    ):
+        m = model.clone()
+        ltxv = _find_ltxv_model(m.model)
+        if ltxv is None:
+            raise ValueError("LTXVEditAnythingLoopingSampler: could not locate LTXVModel inside MODEL wrapper.")
+        m.model_options = dict(m.model_options)
+        to = dict(m.model_options.get("transformer_options", {}))
+        if role_weight is not None and enable_role_embedding:
+            _patch_process_input_once(ltxv)
+            to[_KW_ROLE_WEIGHT] = role_weight
+            to[_KW_APP_LATENTS] = 1
+            to[_KW_ROLE_STRENGTH] = float(role_strength)
+        if adaln_cond is not None and enable_adaln:
+            _patch_prepare_timestep_once(ltxv)
+            to[_KW_ADALN_COND] = adaln_cond
+        if ref_context is not None:
+            to[_KW_REF_CONTEXT] = ref_context
+            to[_KW_REF_SCALE] = float(ref_context_scale)
+            if ref_start_block is not None:
+                to[_KW_REF_START] = int(ref_start_block)
+            if ref_end_block is not None:
+                to[_KW_REF_END] = int(ref_end_block)
+        m.model_options["transformer_options"] = to
+        return m
+
+    @staticmethod
+    def _sample_chunk(model, noise, sampler, sigmas, guider, latent, seed_offset=0):
+        import comfy.sample
+        import comfy.model_management
+        import comfy.utils
+        import latent_preview
+
+        latent = latent.copy()
+        latent_image = latent["samples"]
+        latent_image = comfy.sample.fix_empty_latent_channels(
+            guider.model_patcher,
+            latent_image,
+            latent.get("downscale_ratio_spacial", None),
+        )
+        latent["samples"] = latent_image
+        noise_mask = latent.get("noise_mask")
+
+        original_seed = getattr(noise, "seed", None)
+        if original_seed is not None:
+            noise.seed = original_seed + int(seed_offset)
+
+        x0_output = {}
+        callback = latent_preview.prepare_callback(
+            guider.model_patcher,
+            sigmas.shape[-1] - 1,
+            x0_output,
+        )
+        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+        samples = guider.sample(
+            noise.generate_noise(latent),
+            latent_image,
+            sampler,
+            sigmas,
+            denoise_mask=noise_mask,
+            callback=callback,
+            disable_pbar=disable_pbar,
+            seed=noise.seed if hasattr(noise, "seed") else None,
+        )
+        samples = samples.to(comfy.model_management.intermediate_device())
+
+        if original_seed is not None:
+            noise.seed = original_seed
+
+        out = latent.copy()
+        out.pop("downscale_ratio_spacial", None)
+        out["samples"] = samples
+        return out
+
+    @staticmethod
+    def _add_chunk_blended(final, weights, chunk, start, end, overlap, blend_overlap):
+        device = final.device
+        dtype = final.dtype
+        chunk = chunk.to(device=device, dtype=dtype)
+        length = end - start
+        w = torch.ones((1, 1, length, 1, 1), device=device, dtype=dtype)
+        if blend_overlap and overlap > 0:
+            left = min(overlap, length)
+            if start > 0 and left > 0:
+                w[:, :, :left] *= torch.linspace(0, 1, left, device=device, dtype=dtype).view(1, 1, left, 1, 1)
+            right = min(overlap, length)
+            if end < final.shape[2] and right > 0:
+                w[:, :, -right:] *= torch.linspace(1, 0, right, device=device, dtype=dtype).view(1, 1, right, 1, 1)
+        final[:, :, start:end] += chunk * w
+        weights[:, :, start:end] += w
+
+    @staticmethod
+    def _set_guider_conds(guider, positive, negative, model_patcher=None):
+        import copy as _copy
+        g = _copy.copy(guider)
+        if hasattr(g, "original_conds"):
+            g.original_conds = _copy.deepcopy(g.original_conds)
+        if hasattr(g, "set_conds"):
+            g.set_conds(positive, negative)
+        if hasattr(g, "raw_conds"):
+            g.raw_conds = (positive, negative)
+        # CRITICAL: replace the guider's model_patcher with our patched clone so
+        # that transformer_options (role/AdaLN/ref_context) actually reach the model
+        # forward. Without this, the guider keeps using the original (unpatched)
+        # model_patcher and every transformer_options-based toggle silently no-ops.
+        if model_patcher is not None and hasattr(g, "model_patcher"):
+            g.model_patcher = model_patcher
+        return g
+
+    # ---- main ----
+
+    def sample(
+        self,
+        model, vae, noise, sampler, sigmas, guider,
+        positive, negative, latents,
+        temporal_tile_size, temporal_overlap, blend_overlap=True,
+        lora_name="(none)", editanything_module=None,
+        ref_image=None, guide_frames=None,
+        ref_resize_mode="pad_to_fit",
+        ref_strength=1.0, guide_strength=1.0,
+        role_strength=1.0, adaln_scale=1.0,
+        enable_ic_lora=True, enable_role_embedding=True, enable_adaln=True,
+        reapply_per_chunk=True,
+        enable_visual_crossattn=True,
+        ref_context_scale=0.01, ref_token_scale=0.5,
+        ref_start_block=0, ref_end_block=35,
+        ref_init_from="attn2", ref_init_seed=42,
+        ref_attn_lora_strength=1.0,
+        debug_ea=False,
+    ):
+        import copy as _copy
+
+        # Reset diagnostic counters to verify transformer_options propagation
+        _ea_reset_counters()
+
+        # ── ① Load EA weights (lora or sidecar) ────────────────────────────────
+        sd = _ea_loop_load_state_dict(lora_name, editanything_module)
+        role_weight = _ea_loop_extract_role_weight(sd) if sd else None
+
+        # Detect visual+crossattn checkpoint
+        has_visual = enable_visual_crossattn and sd and _ea_has_ref_visual_keys(sd)
+        has_ref_attn_lora = enable_visual_crossattn and sd and _ea_has_ref_attn_lora(sd)
+
+        # Always-on detection diagnostic
+        ref_visual_proj_keys = sorted([k for k in (sd or {}) if k.startswith("ref_visual_proj.")])
+        ref_attn_lora_keys = sorted([k for k in (sd or {}) if ".ref_attn." in k])[:3]
+        print(f"[EA detect] lora_name='{lora_name}'  sd_keys={len(sd) if sd else 0}  "
+              f"role_weight={'present' if role_weight is not None else 'MISSING'}  "
+              f"enable_visual_crossattn={enable_visual_crossattn}  "
+              f"has_visual={has_visual}  has_ref_attn_lora={has_ref_attn_lora}")
+        print(f"[EA detect] ref_visual_proj.* keys in sd ({len(ref_visual_proj_keys)}): {ref_visual_proj_keys}")
+        print(f"[EA detect] sample ref_attn LoRA keys (first 3): {ref_attn_lora_keys}")
+
+        # ── ② Encode ref / guide once ─────────────────────────────────────────
+        scale_factors = vae.downscale_index_formula
+        time_sf, w_sf, h_sf = scale_factors
+
+        samples = latents["samples"]
+        _, _, total_frames, lat_h, lat_w = samples.shape
+        px_h = lat_h * h_sf
+        px_w = lat_w * w_sf
+
+        ref_lat = None
+        ref_preview = None
+        if ref_image is not None:
+            ref_preview, ref_lat = self._encode_ref(vae, ref_image, px_w, px_h, ref_resize_mode)
+
+        guide_lat = None
+        if guide_frames is not None:
+            guide_lat = self._encode_guide(vae, guide_frames, px_w, px_h, time_sf)
+
+        adaln_cond = None
+        if ref_lat is not None and enable_adaln and adaln_scale > 0 and sd:
+            adaln_cond = _ea_loop_compute_adaln_cond(sd, ref_lat, adaln_scale)
+
+        # ── ②b Visual cross-attn path (auto-detected from checkpoint) ─────────
+        # Installs ref_attn modules, applies ref_attn LoRA, and computes the
+        # 32-token visual context. Done ONCE on the shared ltxv module before
+        # the chunk loop.
+        ref_context = None
+        # Locate the shared ltxv module (same instance whether we use model or
+        # guider.model_patcher.model — clones share submodules).
+        ltxv_handle = _find_ltxv_model(model.model)
+        if ltxv_handle is None and hasattr(guider, "model_patcher"):
+            ltxv_handle = _find_ltxv_model(guider.model_patcher.model)
+        if has_visual and ref_lat is not None:
+            if ltxv_handle is None:
+                logger.warning("LTXVEditAnythingLoopingSampler: could not locate LTXV model; skipping visual cross-attn path.")
+            else:
+                # Force-load model weights to GPU so attn1/attn2 are materialized
+                # before we try to copy them into ref_attn. Without this, ComfyUI's
+                # lazy loading leaves them on meta device and load_state_dict fails
+                # with "Cannot copy out of meta tensor".
+                if ref_init_from in ("attn1", "attn2"):
+                    try:
+                        import comfy.model_management
+                        mp_for_load = getattr(guider, "model_patcher", None) or model
+                        comfy.model_management.load_models_gpu([mp_for_load], force_full_load=True)
+                    except Exception as exc:
+                        logger.warning(
+                            "Could not force-load model before ref_attn install (%s). "
+                            "Falling back to random init.", exc
+                        )
+                        ref_init_from = "none"
+
+                context_dim = sd["ref_visual_proj.proj.weight"].shape[0]
+                _ea_install_ref_attn_modules(
+                    ltxv_handle, context_dim, ref_init_seed, init_from=ref_init_from
+                )
+                if has_ref_attn_lora:
+                    _ea_apply_ref_attn_lora(ltxv_handle, sd, ref_attn_lora_strength)
+                _ea_patch_block_forward_once(ltxv_handle)
+                ref_context = _ea_build_ref_visual_context(sd, ref_lat, ref_token_scale)
+                if debug_ea:
+                    print(f"[LTXVEditAnythingLoopingSampler] visual cross-attn ENABLED: "
+                          f"ref_context shape={list(ref_context.shape)} "
+                          f"context_dim={context_dim} "
+                          f"blocks=[{ref_start_block}, {ref_end_block}] "
+                          f"ref_context_scale={ref_context_scale} "
+                          f"ref_token_scale={ref_token_scale}")
+
+        # Also install role/adaln patches on the shared ltxv if needed
+        if ltxv_handle is not None:
+            if role_weight is not None and enable_role_embedding:
+                _patch_process_input_once(ltxv_handle)
+            if adaln_cond is not None and enable_adaln:
+                _patch_prepare_timestep_once(ltxv_handle)
+
+        # ── ②c CRITICAL: inject our keys IN-PLACE into the guider's
+        # transformer_options dict. The CFGGuider captures
+        # `self.model_options = model_patcher.model_options` BY REFERENCE at
+        # construction time (see comfy/samplers.py:937). Replacing the outer
+        # dict via `model_patcher.model_options = dict(...)` does NOT propagate
+        # to the guider's captured reference. We must mutate the existing
+        # `transformer_options` sub-dict in place.
+        #
+        # We also try guider.model_options directly as the primary target since
+        # that is what the sampler actually uses (line 972: clone of self.model_options).
+        guider_mp = getattr(guider, "model_patcher", None)
+        target_model_options = None
+        if hasattr(guider, "model_options") and isinstance(getattr(guider, "model_options"), dict):
+            target_model_options = guider.model_options
+        elif guider_mp is not None and hasattr(guider_mp, "model_options"):
+            target_model_options = guider_mp.model_options
+
+        injected_keys = []           # keys we added (need to delete on restore)
+        overwritten_keys = {}        # keys we overwrote (need to restore values)
+        target_to_dict = None
+        if target_model_options is not None:
+            if "transformer_options" not in target_model_options:
+                target_model_options["transformer_options"] = {}
+            target_to_dict = target_model_options["transformer_options"]
+
+            def _inject(k, v):
+                if k in target_to_dict:
+                    overwritten_keys[k] = target_to_dict[k]
+                else:
+                    injected_keys.append(k)
+                target_to_dict[k] = v
+
+            if role_weight is not None and enable_role_embedding:
+                _inject(_KW_ROLE_WEIGHT, role_weight)
+                _inject(_KW_APP_LATENTS, 1)
+                _inject(_KW_ROLE_STRENGTH, float(role_strength))
+            if adaln_cond is not None and enable_adaln:
+                _inject(_KW_ADALN_COND, adaln_cond)
+            if ref_context is not None:
+                _inject(_KW_REF_CONTEXT, ref_context)
+                _inject(_KW_REF_SCALE, float(ref_context_scale))
+                _inject(_KW_REF_START, int(ref_start_block))
+                _inject(_KW_REF_END, int(ref_end_block))
+
+            # Always print injection diagnostics — critical for debugging propagation.
+            guider_cls = type(guider).__name__
+            via = "guider.model_options" if target_model_options is getattr(guider, "model_options", None) else "guider.model_patcher.model_options"
+            print(f"[EA inject] guider_cls={guider_cls}  via={via}  "
+                  f"target_dict_id={id(target_to_dict)}  "
+                  f"role={'yes' if (role_weight is not None and enable_role_embedding) else 'no'}  "
+                  f"adaln={'yes' if (adaln_cond is not None and enable_adaln) else 'no'}  "
+                  f"ref_context={'yes' if ref_context is not None else 'no'}")
+            our_keys_in_dict = sorted([k for k in target_to_dict.keys() if k.startswith("ea_")])
+            print(f"[EA inject] ea_* keys NOW in target_to_dict: {our_keys_in_dict}")
+            # Also check the OTHER possible target to confirm we mutated the one the sampler uses.
+            other = None
+            other_label = None
+            if target_model_options is getattr(guider, "model_options", None) and guider_mp is not None and hasattr(guider_mp, "model_options"):
+                other = guider_mp.model_options.get("transformer_options")
+                other_label = "guider.model_patcher.model_options.transformer_options"
+            elif target_model_options is not getattr(guider, "model_options", None) and hasattr(guider, "model_options"):
+                other = guider.model_options.get("transformer_options") if isinstance(getattr(guider, "model_options"), dict) else None
+                other_label = "guider.model_options.transformer_options"
+            if other is not None:
+                other_keys = sorted([k for k in other.keys() if k.startswith("ea_")])
+                same = other is target_to_dict
+                print(f"[EA inject] other target check: {other_label} id={id(other)} same_obj={same} ea_keys={other_keys}")
+
+        # ── ③ Tile params (latent space) ──────────────────────────────────────
+        tile = max(1, int(temporal_tile_size) // int(time_sf))
+        overlap = max(0, int(temporal_overlap) // int(time_sf))
+        if overlap >= tile:
+            overlap = max(0, tile - 1)
+        step = max(1, tile - overlap)
+
+        final = torch.zeros_like(samples)
+        weights = torch.zeros_like(samples)
+
+        # Pre-derive a noise_mask for the full latent (per-chunk slices come from it)
+        full_noise_mask = latents.get("noise_mask")
+        if full_noise_mask is None:
+            full_noise_mask = torch.ones(
+                (samples.shape[0], 1, total_frames, lat_h, lat_w),
+                dtype=samples.dtype, device=samples.device,
+            )
+
+        if debug_ea:
+            print("[LTXVEditAnythingLoopingSampler DEBUG]")
+            print(f"  total latent frames : {total_frames}")
+            print(f"  tile/overlap (lat)  : {tile}/{overlap}  step={step}")
+            print(f"  ref_lat   : {None if ref_lat is None else list(ref_lat.shape)}")
+            print(f"  guide_lat : {None if guide_lat is None else list(guide_lat.shape)}")
+            print(f"  role_weight present : {role_weight is not None}")
+            print(f"  adaln_cond present  : {adaln_cond is not None}")
+
+        chunk_index = 0
+        start = 0
+        try:
+            while start < total_frames:
+                end = min(total_frames, start + tile)
+                if start > 0 and end - start < max(1, overlap + 1):
+                    start = max(0, total_frames - tile)
+                    end = total_frames
+
+                chunk_target_frames = end - start
+                chunk_latent = samples[:, :, start:end, :, :].clone()
+                chunk_mask = full_noise_mask[:, :, start:end, :, :].clone() if full_noise_mask.dim() == 5 else full_noise_mask
+
+                # Pick guide slice for this chunk
+                guide_chunk_lat = self._slice_guide_lat(guide_lat, start, end)
+
+                do_append = enable_ic_lora and (reapply_per_chunk or chunk_index == 0)
+                chunk_pos = _copy.deepcopy(positive)
+                chunk_neg = _copy.deepcopy(negative)
+
+                (chunk_pos, chunk_neg, chunk_latent_app, chunk_mask_app,
+                 appended) = self._build_chunk_conds(
+                    chunk_pos, chunk_neg, chunk_latent, chunk_mask,
+                    ref_lat if do_append else None,
+                    guide_chunk_lat if do_append else None,
+                    scale_factors, ref_strength, guide_strength,
+                    enable_ic_lora=do_append,
+                )
+
+                # NOTE: model_patcher swap kept for compatibility but the real
+                # propagation is via guider.model_patcher.model_options mutation
+                # above (lines ~1700). The swap alone was insufficient.
+                patched_model = self._patch_chunk_model(
+                    model, role_weight, adaln_cond, role_strength,
+                    enable_role_embedding, enable_adaln,
+                    ref_context=ref_context,
+                    ref_context_scale=ref_context_scale,
+                    ref_start_block=ref_start_block,
+                    ref_end_block=ref_end_block,
+                )
+
+                chunk_guider = self._set_guider_conds(
+                    guider, chunk_pos, chunk_neg, model_patcher=patched_model
+                )
+
+                if debug_ea:
+                    print(f"[LTXVEditAnythingLoopingSampler] chunk {chunk_index}: "
+                          f"latent {start}:{end} (target={chunk_target_frames}) "
+                          f"appended_latent_frames={appended} "
+                          f"guide_slice={None if guide_chunk_lat is None else list(guide_chunk_lat.shape)}")
+
+                chunk_in = {"samples": chunk_latent_app, "noise_mask": chunk_mask_app}
+                chunk_out = self._sample_chunk(
+                    patched_model, noise, sampler, sigmas, chunk_guider,
+                    chunk_in, seed_offset=start,
+                )
+
+                # Strip appended ref/guide frames from tail before blending
+                chunk_samples = chunk_out["samples"][:, :, :chunk_target_frames, :, :]
+                self._add_chunk_blended(
+                    final, weights, chunk_samples,
+                    start, end, overlap, blend_overlap,
+                )
+
+                chunk_index += 1
+                if end >= total_frames:
+                    break
+                start += step
+        finally:
+            # Restore the transformer_options dict we mutated in place.
+            # Delete keys we added; restore values we overwrote.
+            if target_to_dict is not None:
+                for k in injected_keys:
+                    target_to_dict.pop(k, None)
+                for k, v in overwritten_keys.items():
+                    target_to_dict[k] = v
+
+        out = latents.copy()
+        out.pop("downscale_ratio_spacial", None)
+        out["samples"] = final / weights.clamp_min(1e-8)
+        if ref_preview is None:
+            ref_preview = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+
+        # ── In-node A/B diff: compare current output against the last run held
+        # in class state (survives across ComfyUI executions in the same process).
+        cur_config = {
+            "enable_ic_lora": bool(enable_ic_lora),
+            "enable_role_embedding": bool(enable_role_embedding),
+            "enable_adaln": bool(enable_adaln),
+            "enable_visual_crossattn": bool(enable_visual_crossattn),
+            "reapply_per_chunk": bool(reapply_per_chunk),
+            "ref_strength": float(ref_strength),
+            "guide_strength": float(guide_strength),
+            "role_strength": float(role_strength),
+            "adaln_scale": float(adaln_scale),
+            "ref_context_scale": float(ref_context_scale),
+            "ref_token_scale": float(ref_token_scale),
+            "ref_start_block": int(ref_start_block),
+            "ref_end_block": int(ref_end_block),
+            "lora_name": str(lora_name),
+            "has_visual_in_sd": bool(has_visual),
+            "has_ref_attn_lora_in_sd": bool(has_ref_attn_lora),
+            "temporal_tile_size": int(temporal_tile_size),
+            "temporal_overlap": int(temporal_overlap),
+        }
+        cls = self.__class__
+        if cls._LAST_RUN_LATENT is None:
+            diff_str = "[LoopingSampler diff vs previous run] no previous run yet — saved current as baseline"
+        else:
+            diff_str = _ea_loop_compute_diff_str(
+                cls._LAST_RUN_LATENT, cls._LAST_RUN_CONFIG, out["samples"], cur_config
+            )
+
+        # Append patch-firing counters to the diff string — always shown, so we
+        # can diagnose whether transformer_options is actually propagating.
+        counters_str = _ea_format_counters()
+        diff_str = diff_str + "\n" + counters_str
+
+        if debug_ea:
+            print(diff_str)
+        # Also always print counters to console for easy log inspection
+        print(counters_str)
+        # Store current as previous for next run. Keep on CPU to avoid VRAM pressure.
+        cls._LAST_RUN_LATENT = out["samples"].detach().cpu().clone()
+        cls._LAST_RUN_CONFIG = cur_config
+
+        return (out, ref_preview, diff_str)
+
+
+class LTXVLatentDiffMetrics:
+    """Compare two LATENTs and report MSE / RMSE / L1 / PSNR / cosine similarity.
+
+    Use to A/B-test toggles: run the sampler with config A, SaveLatent → run with
+    config B → wire SaveLatent.A and the new output into this node. Outputs both
+    a formatted string for UI/console and separate floats so you can chain to a
+    plotter or save-as-text node.
+
+    If the two latents have different shapes (e.g. spatial mismatch from VAE
+    differences), it falls back to comparing the overlapping subregion.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "latent_a": ("LATENT",),
+                "latent_b": ("LATENT",),
+            },
+            "optional": {
+                "label": ("STRING", {"default": "A vs B", "multiline": False}),
+                "print_console": ("BOOLEAN", {"default": True}),
+                "compare_noise_mask": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "If True, also reports diff stats restricted to the noisy region of latent_a (where noise_mask > 0).",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "LATENT", "FLOAT", "FLOAT", "FLOAT", "FLOAT")
+    RETURN_NAMES = ("metrics", "latent_a", "mse", "psnr", "l1", "cosine")
+    FUNCTION = "compare"
+    CATEGORY = "LTXV/EditAnything"
+
+    @staticmethod
+    def _slice_overlap(a, b):
+        if a.shape == b.shape:
+            return a, b, False
+        slices = tuple(slice(0, min(da, db)) for da, db in zip(a.shape, b.shape))
+        return a[slices], b[slices], True
+
+    @staticmethod
+    def _stats(diff, a, b):
+        import math
+        mse = (diff.pow(2)).mean().item()
+        rmse = math.sqrt(mse) if mse > 0 else 0.0
+        l1 = diff.abs().mean().item()
+        max_abs = diff.abs().max().item()
+        peak = max(a.abs().max().item(), b.abs().max().item(), 1e-8)
+        psnr = 20.0 * math.log10(peak / rmse) if rmse > 0 else float("inf")
+        a_flat = a.flatten()
+        b_flat = b.flatten()
+        denom = (a_flat.norm() * b_flat.norm()).clamp_min(1e-8)
+        cos = ((a_flat * b_flat).sum() / denom).item()
+        return mse, rmse, l1, max_abs, psnr, cos
+
+    def compare(self, latent_a, latent_b, label="A vs B", print_console=True, compare_noise_mask=False):
+        a_full = latent_a["samples"].detach().float().cpu()
+        b_full = latent_b["samples"].detach().float().cpu()
+        a, b, sliced = self._slice_overlap(a_full, b_full)
+        identical = bool(torch.equal(a, b))
+        diff = a - b
+
+        mse, rmse, l1, max_abs, psnr, cos = self._stats(diff, a, b)
+        a_mean, a_std = a.mean().item(), a.std().item()
+        b_mean, b_std = b.mean().item(), b.std().item()
+
+        lines = [
+            f"[LatentDiff] {label}",
+            f"  shape_a = {list(latent_a['samples'].shape)}",
+            f"  shape_b = {list(latent_b['samples'].shape)}",
+            f"  identical_bitwise = {identical}{'  (after slicing to overlap)' if sliced and not identical else ''}",
+            f"  MSE     = {mse:.6e}",
+            f"  RMSE    = {rmse:.6e}",
+            f"  L1_mean = {l1:.6e}",
+            f"  MaxAbs  = {max_abs:.6e}",
+            f"  PSNR    = {psnr:.2f} dB",
+            f"  Cosine  = {cos:.6f}",
+            f"  A       mean={a_mean:+.4f} std={a_std:.4f}",
+            f"  B       mean={b_mean:+.4f} std={b_std:.4f}",
+        ]
+
+        if compare_noise_mask and "noise_mask" in latent_a and latent_a["noise_mask"] is not None:
+            mask = latent_a["noise_mask"].detach().float().cpu()
+            if mask.dim() == 5 and mask.shape[2:] == a.shape[2:]:
+                m = (mask > 0).any(dim=1, keepdim=True).expand_as(a)
+                if m.any():
+                    a_m = a[m]
+                    b_m = b[m]
+                    diff_m = a_m - b_m
+                    mse_m, rmse_m, l1_m, max_m, psnr_m, cos_m = self._stats(diff_m, a_m, b_m)
+                    lines.append(f"  --- restricted to noisy region ({int(m.sum().item())} voxels) ---")
+                    lines.append(f"  MSE_mask  = {mse_m:.6e}")
+                    lines.append(f"  L1_mask   = {l1_m:.6e}")
+                    lines.append(f"  PSNR_mask = {psnr_m:.2f} dB")
+
+        if sliced:
+            lines.append(f"  WARNING: shapes differ; sliced to overlap {list(a.shape)}")
+
+        out = "\n".join(lines)
+        if print_console:
+            print(out)
+        return (out, latent_a, float(mse), float(psnr), float(l1), float(cos))
+
+
+class LTXVImageDiffMetrics:
+    """Same as LTXVLatentDiffMetrics but for decoded IMAGE (post-VAE) — uses [0, 1]
+    pixel range for PSNR. Useful after decoding two runs to compare visually-relevant
+    pixel error.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image_a": ("IMAGE",),
+                "image_b": ("IMAGE",),
+            },
+            "optional": {
+                "label": ("STRING", {"default": "A vs B", "multiline": False}),
+                "print_console": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "IMAGE", "FLOAT", "FLOAT", "FLOAT")
+    RETURN_NAMES = ("metrics", "image_a", "mse", "psnr", "l1")
+    FUNCTION = "compare"
+    CATEGORY = "LTXV/EditAnything"
+
+    def compare(self, image_a, image_b, label="A vs B", print_console=True):
+        import math
+        a_full = image_a.detach().float().cpu().clamp(0, 1)
+        b_full = image_b.detach().float().cpu().clamp(0, 1)
+        slices = tuple(slice(0, min(da, db)) for da, db in zip(a_full.shape, b_full.shape))
+        a = a_full[slices]
+        b = b_full[slices]
+        sliced = a.shape != a_full.shape or b.shape != b_full.shape
+
+        diff = a - b
+        mse = (diff.pow(2)).mean().item()
+        rmse = math.sqrt(mse) if mse > 0 else 0.0
+        l1 = diff.abs().mean().item()
+        max_abs = diff.abs().max().item()
+        psnr = 20.0 * math.log10(1.0 / rmse) if rmse > 0 else float("inf")
+        identical = bool(torch.equal(a, b))
+
+        # per-frame MSE for quick spot of where frames diverge
+        if a.dim() == 4:
+            per_frame_mse = diff.pow(2).mean(dim=(1, 2, 3)).tolist()
+            per_frame_summary = (
+                f"per_frame_mse: min={min(per_frame_mse):.4e} "
+                f"max={max(per_frame_mse):.4e} "
+                f"argmax_frame={per_frame_mse.index(max(per_frame_mse))}"
+            )
+        else:
+            per_frame_summary = "(non-video tensor)"
+
+        lines = [
+            f"[ImageDiff] {label}",
+            f"  shape_a = {list(image_a.shape)}",
+            f"  shape_b = {list(image_b.shape)}",
+            f"  identical_bitwise = {identical}",
+            f"  MSE     = {mse:.6e}",
+            f"  RMSE    = {rmse:.6e}",
+            f"  L1_mean = {l1:.6e}",
+            f"  MaxAbs  = {max_abs:.6e}",
+            f"  PSNR    = {psnr:.2f} dB  (pixel range [0,1])",
+            f"  {per_frame_summary}",
+        ]
+        if sliced:
+            lines.append(f"  WARNING: shapes differ; sliced to overlap {list(a.shape)}")
+
+        out = "\n".join(lines)
+        if print_console:
+            print(out)
+        return (out, image_a, float(mse), float(psnr), float(l1))
+
+
 NODE_CLASS_MAPPINGS = {
-    "LTXVEditAnythingSplitLora": LTXVEditAnythingSplitLora,
     "LTXVEditAnythingModuleLoader": LTXVEditAnythingModuleLoader,
-    "LTXVEditAnythingLoraLoader": LTXVEditAnythingLoraLoader,
-    "LTXVEditAnythingApply": LTXVEditAnythingApply,
+    "LTXVEditAnythingLoopingSampler": LTXVEditAnythingLoopingSampler,
     "LTXVApplyNeutralMask": LTXVApplyNeutralMask,
     "LTXVResizeReferenceByMask": LTXVResizeReferenceByMask,
+    "LTXVLatentDiffMetrics": LTXVLatentDiffMetrics,
+    "LTXVImageDiffMetrics": LTXVImageDiffMetrics,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "LTXVEditAnythingSplitLora": "LTXV Edit Anything Split LoRA",
     "LTXVEditAnythingModuleLoader": "LTXV Edit Anything Module Loader",
-    "LTXVEditAnythingLoraLoader": "LTXV Edit Anything LoRA Loader",
-    "LTXVEditAnythingApply": "LTXV Edit Anything (Apply)",
+    "LTXVEditAnythingLoopingSampler": "LTXV Edit Anything Looping Sampler",
     "LTXVApplyNeutralMask": "LTXV Apply Neutral Mask",
     "LTXVResizeReferenceByMask": "LTXV Resize Reference By Mask",
+    "LTXVLatentDiffMetrics": "LTXV Latent Diff Metrics",
+    "LTXVImageDiffMetrics": "LTXV Image Diff Metrics",
 }
