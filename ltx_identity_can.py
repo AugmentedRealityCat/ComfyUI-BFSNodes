@@ -1,18 +1,14 @@
 """LTX Identity CAN (AdaLN) — apply the trained Conditioned Adaptive Normalization at inference.
 
-The ArcFace-projector (appended text tokens) has ~0 impact because cross-attention can ignore the
-appended tokens. CAN instead injects identity into the AdaLN (shift+gate of the self-attention
-normalization) of the even blocks — a channel the model CANNOT ignore, since it modulates every
-activation. Trained on top of the reference/overlap LoRA it lifts identity a lot while keeping the
-no-first-frame-leak behaviour.
+The ArcFace projector (appended text tokens) has ~0 impact (cross-attn can ignore appended tokens).
+CAN instead modulates the self-attention AdaLN (shift + gate) of the even blocks with the reference
+ArcFace — a channel the model can't ignore. Trained on top of the reference LoRA it lifts identity
+a lot (humo 0.52 -> 0.69) with no first-frame leak.
 
-This node reproduces the training CAN (ltx-core) on ComfyUI's NATIVE LTX blocks: it rebuilds a
-CANModulation per even block, loads the trained weights (identity_adapters_step_*.safetensors,
-keys can.<i>.*), extracts the reference face's ArcFace embedding, and patches each even block's
-forward so shift_msa += dshift and gate_msa += tanh(dgate) — exactly the training formula.
-
-Inputs: model, reference_image, can_weights (the identity_adapters file), strength.
-Output: MODEL with CAN applied. Combine with the identity LoRA + the overlap reference node.
+Key trick: the CAN delta depends only on the (constant) reference ArcFace, and the block AdaLN is
+`scale_shift_table[row] + timestep`. So instead of patching the (version-specific, AV) block
+forward, we just add the delta into `scale_shift_table` (row 0 = shift_msa, row 2 = gate_msa) via
+ComfyUI's reversible add_object_patch — mathematically identical, works on any LTX/LTXAV version.
 """
 from __future__ import annotations
 
@@ -23,8 +19,7 @@ from safetensors.torch import load_file
 
 
 class CANModulation(nn.Module):
-    """Exact replica of ltx-core CANModulation: id_global[512] -> (dshift,dscale,dgate)[dim].
-    Only shift+gate are used (scale darkens). Zero-init output = no-op until trained."""
+    """Exact replica of ltx-core CANModulation: id_global[512] -> (dshift, dgate)[dim]."""
 
     def __init__(self, id_dim: int, dim: int, hidden: int = 512):
         super().__init__()
@@ -36,6 +31,70 @@ class CANModulation(nn.Module):
         d = self.mlp(self.norm(id_global))
         dshift, _dscale, dgate = d.chunk(3, dim=-1)
         return dshift, dgate
+
+
+def _find_diffusion_model(mp):
+    m = getattr(mp, "model", mp)
+    return getattr(m, "diffusion_model", m)
+
+
+def apply_can_to_model(model_patcher, reference_image, can_weights_name, strength=1.0,
+                       arcface_mode="auto_adjust"):
+    """Add the trained CAN identity modulation to a ModelPatcher (in place, reversible).
+    Returns the number of blocks modulated."""
+    import folder_paths
+    from .ltx_identity_overlap import _arcface_embed
+
+    path = folder_paths.get_full_path("loras", can_weights_name)
+    sd = load_file(path)
+    idxs = sorted({int(k.split(".")[1]) for k in sd if k.startswith("can.")})
+    if not idxs:
+        print("[BFS CAN] no can.* weights in file — nothing to apply.")
+        return 0
+
+    face = _arcface_embed(reference_image, arcface_mode) if _arcface_takes_mode() else _arcface_embed(reference_image)
+    if face is None:
+        print("[BFS CAN] no face detected in reference — CAN skipped.")
+        return 0
+    id_global = torch.as_tensor(np.asarray(face), dtype=torch.float32).view(1, -1)  # [1,512]
+
+    dm = _find_diffusion_model(model_patcher)
+    blocks = list(dm.transformer_blocks)
+    even_blocks = blocks[::2]  # CAN was trained on even blocks (0,2,4,…) -> saved can.0,can.1,…
+    n = min(len(idxs), len(even_blocks))
+    applied = 0
+    for j in range(n):
+        # find this even block's index in the full list (for the dotted patch name)
+        blk = even_blocks[j]
+        block_index = j * 2
+        sst = blk.scale_shift_table
+        if sst.shape[0] < 3:
+            continue
+        dim = sst.shape[1]
+        can = CANModulation(id_dim=id_global.shape[1], dim=dim)
+        can.load_state_dict({k[len(f"can.{idxs[j]}."):]: v for k, v in sd.items()
+                             if k.startswith(f"can.{idxs[j]}.")})
+        can = can.eval()
+        with torch.no_grad():
+            dshift, dgate = can(id_global)               # [1, dim]
+        new_sst = sst.detach().clone().float()
+        new_sst[0] = new_sst[0] + strength * dshift[0]                 # shift_msa
+        new_sst[2] = new_sst[2] + strength * torch.tanh(dgate)[0]      # gate_msa
+        new_param = nn.Parameter(new_sst.to(sst.dtype), requires_grad=False)
+        name = f"diffusion_model.transformer_blocks.{block_index}.scale_shift_table"
+        model_patcher.add_object_patch(name, new_param)
+        applied += 1
+    print(f"[BFS CAN] applied CAN (AdaLN) to {applied} even blocks (strength {strength}).")
+    return applied
+
+
+def _arcface_takes_mode():
+    import inspect
+    from .ltx_identity_overlap import _arcface_embed
+    try:
+        return "mode" in inspect.signature(_arcface_embed).parameters
+    except Exception:
+        return False
 
 
 class LTXIdentityCAN:
@@ -59,82 +118,9 @@ class LTXIdentityCAN:
     def apply(self, model, reference_image, can_weights, strength):
         if can_weights == "None":
             return (model,)
-        import folder_paths
-        import comfy.model_management as mm
-        from .ltx_identity_overlap import _find_ltxv, _arcface_embed
-
-        device = mm.get_torch_device()
-        sd = load_file(folder_paths.get_full_path("loras", can_weights))
-        # keys: can.<i>.norm.* / can.<i>.mlp.* — group by block index i
-        idxs = sorted({int(k.split(".")[1]) for k in sd if k.startswith("can.")})
-        if not idxs:
-            print("[BFS CAN] no can.* weights in file — nothing to apply.")
-            return (model,)
-
-        # ArcFace identity of the reference (same encoder as training).
-        face = _arcface_embed(reference_image)
-        id_global = torch.as_tensor(face, device=device, dtype=torch.float32).view(1, -1)  # [1,512]
-
         m = model.clone()
-        ltxv = _find_ltxv(m.model)
-        blocks = [b for b in ltxv.transformer_blocks]
-        dtype = next(ltxv.parameters()).dtype
-
-        # CAN was attached to EVEN blocks (0,2,4,…), saved as can.0, can.1, … in that order.
-        even_blocks = blocks[::2]
-        n = min(len(idxs), len(even_blocks))
-        for j in range(n):
-            blk = even_blocks[j]
-            dim = blk.scale_shift_table.shape[1]
-            can = CANModulation(id_dim=id_global.shape[1], dim=dim)
-            can.load_state_dict({k[len(f"can.{idxs[j]}."):]: v for k, v in sd.items()
-                                 if k.startswith(f"can.{idxs[j]}.")})
-            can = can.to(device, dtype).eval()
-            with torch.no_grad():
-                dshift, dgate = can(id_global.to(dtype))          # [1, dim] each
-            blk._can_dshift = (dshift * strength).to(dtype)
-            blk._can_dgate = (torch.tanh(dgate) * strength).to(dtype)
-            if not getattr(blk, "_can_patched", False):
-                _patch_block(blk)
-                blk._can_patched = True
-
-        print(f"[BFS CAN] applied CAN to {n} even blocks (strength {strength}).")
+        apply_can_to_model(m, reference_image, can_weights, strength)
         return (m,)
-
-
-def _patch_block(blk):
-    """Wrap the native block.forward so the CAN deltas are added to shift_msa / gate_msa —
-    exactly the training formula (shift += dshift, gate += tanh(dgate))."""
-    import comfy.ldm.common_dit
-    orig = blk.forward
-
-    def fwd(x, context=None, attention_mask=None, timestep=None, pe=None,
-            transformer_options={}, self_attention_mask=None, prompt_timestep=None):
-        sst = blk.scale_shift_table
-        vals = (sst[None, None, :6].to(device=x.device, dtype=x.dtype)
-                + timestep.reshape(x.shape[0], timestep.shape[1], sst.shape[0], -1)[:, :, :6, :]).unbind(dim=2)
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = vals
-        # CAN: identity modulates the self-attn AdaLN (shift + gate). Broadcast [1,dim]->[B,1,dim].
-        shift_msa = shift_msa + blk._can_dshift.unsqueeze(1).to(shift_msa.dtype)
-        gate_msa = gate_msa + blk._can_dgate.unsqueeze(1).to(gate_msa.dtype)
-
-        x = x + blk.attn1(comfy.ldm.common_dit.rms_norm(x) * (1 + scale_msa) + shift_msa,
-                          pe=pe, mask=self_attention_mask, transformer_options=transformer_options) * gate_msa
-        if blk.cross_attention_adaln:
-            from comfy.ldm.lightricks.model import apply_cross_attention_adaln
-            sq, scq, gq = (sst[None, None, 6:9].to(device=x.device, dtype=x.dtype)
-                           + timestep.reshape(x.shape[0], timestep.shape[1], sst.shape[0], -1)[:, :, 6:9, :]).unbind(dim=2)
-            x = x + apply_cross_attention_adaln(x, context, blk.attn2, sq, scq, gq,
-                                                blk.prompt_scale_shift_table, prompt_timestep,
-                                                attention_mask, transformer_options)
-        else:
-            x = x + blk.attn2(x, context=context, mask=attention_mask, transformer_options=transformer_options)
-        y = comfy.ldm.common_dit.rms_norm(x)
-        y = torch.addcmul(y, y, scale_mlp).add_(shift_mlp)
-        x = x + blk.ff(y) * gate_mlp
-        return x
-
-    blk.forward = fwd
 
 
 NODE_CLASS_MAPPINGS = {"LTXIdentityCAN": LTXIdentityCAN}
