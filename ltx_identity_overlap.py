@@ -319,16 +319,6 @@ class LTXIdentityOverlapConditioning:
             "identity_projector": (proj_choices, {"default": "None",
                              "tooltip": "ArcFace projector .safetensors (from models/loras). 'None' = overlap only "
                                         "(the projector is a weak channel; overlap latent carries identity)."}),
-            "can_weights": (proj_choices, {"default": "None",
-                             "tooltip": "CAN / AdaLN identity file (identity_adapters_*.safetensors from models/loras). "
-                                        "Modulates the AdaLN of even blocks with the reference ArcFace — the STRONG "
-                                        "identity channel (much better than the projector). 'None' = off."}),
-            "can_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
-                             "tooltip": "Strength of the CAN AdaLN modulation (1.0 = as trained)."}),
-            "can_face_mode": (["auto_adjust", "as_is"], {"default": "auto_adjust",
-                             "tooltip": "Face detection for the CAN reference ArcFace. auto_adjust: retry with "
-                                        "zoom-out/upscale if no face. The CAN NEEDS a face (that's the identity it "
-                                        "injects), so this is independent of the projector's arcface_mode."}),
             "source_id": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 8.0, "step": 1.0,
                                     "tooltip": "source_phase segment id (training used 2). 0 = no phase."}),
             "phase_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.1}),
@@ -350,8 +340,7 @@ class LTXIdentityOverlapConditioning:
                    "plus ArcFace projector tokens. Ref is separate tokens (NOT I2V). Load LoRA on MODEL first.")
 
     def apply(self, model, positive, negative, vae, latent, reference_face,
-              identity_projector="None", can_weights="None", can_strength=1.0,
-              can_face_mode="auto_adjust", source_id=2.0, phase_scale=1.0, id_strength=1.0,
+              identity_projector="None", source_id=2.0, phase_scale=1.0, id_strength=1.0,
               arcface_mode="auto_adjust", debug_log=False):
         import comfy.utils
 
@@ -361,15 +350,6 @@ class LTXIdentityOverlapConditioning:
         m = model.clone()
         ltxv = _find_ltxv(m)
 
-        # CAN / AdaLN identity modulation (the strong channel) — applied to the same model+reference.
-        # The CAN REQUIRES the reference ArcFace, so always try to detect (auto_adjust), independent
-        # of arcface_mode (which only governs the weak projector; 'disable' must not disable the CAN).
-        if can_weights and can_weights != "None":
-            try:
-                from .ltx_identity_can import apply_can_to_model
-                apply_can_to_model(m, reference_face, can_weights, can_strength, can_face_mode)
-            except Exception as e:
-                print(f"[LTXIdOverlap] CAN not applied: {e!r}")
 
         # encode ref image -> single-frame latent at the target resolution (overlap grid)
         _, w_sf, h_sf = vae.downscale_index_formula
