@@ -142,6 +142,14 @@ def _install_multi_patches(ltxv):
             if timestep.dim() <= 1:
                 timestep = timestep.reshape(-1, 1).expand(batch_size, tgt_len).contiguous()
             cur = timestep.shape[1]
+            # With audio connected, LTXAV may produce a combined video+audio per-token
+            # timestep (e.g. 24576 = video 6144 + audio 18432). Trim to video-only so
+            # the extension matches vx (which only has video + ref tokens).
+            if cur > tgt_len + ref_len:
+                _dbg("prepare_timestep: oversized", cur, "(tgt", tgt_len, "+ ref", ref_len,
+                     ") -> trimming to video-only", tgt_len)
+                timestep = timestep[:, :tgt_len]
+                cur = tgt_len
             if cur == tgt_len:            # per-token, target only -> append per-token zeros
                 z = torch.zeros(timestep.shape[0], ref_len, *timestep.shape[2:],
                                 device=timestep.device, dtype=timestep.dtype)
