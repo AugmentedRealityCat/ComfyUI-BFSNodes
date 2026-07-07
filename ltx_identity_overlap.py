@@ -234,6 +234,16 @@ def _install_patches(ltxv):
             if timestep.dim() >= 2:
                 ref_ts = torch.zeros(batch_size, ref_len, *timestep.shape[2:], device=timestep.device, dtype=timestep.dtype)
                 timestep = torch.cat([timestep, ref_ts], dim=1)
+            # Guide nodes (IC-LoRA Guide / Director Guide, etc.) inject a grid_mask that
+            # FILTERS x tokens in _process_input (x = x[:, grid_mask]) and later indexes the
+            # timestep (timestep[:, grid_mask]). Our ref tokens are appended AFTER that
+            # filter, so extend the mask with True for them — keeps modulation and vx in
+            # lockstep (False would drop our clean timesteps and desync again).
+            gm = kw.get("grid_mask")
+            if gm is not None and hasattr(gm, "shape"):
+                pad = torch.ones(*gm.shape[:-1], ref_len, dtype=gm.dtype, device=gm.device)
+                kw = dict(kw); kw["grid_mask"] = torch.cat([gm, pad], dim=-1)
+                _dbg("prepare_timestep: grid_mask extended", tuple(gm.shape), "->", tuple(kw["grid_mask"].shape))
             _dbg("prepare_timestep: ref_len", ref_len, "| timestep ->", _shape(timestep), "| target_len", getattr(self, "_id_target_len", None))
         return orig_prepare_ts(timestep, batch_size, hidden_dtype, **kw)
 

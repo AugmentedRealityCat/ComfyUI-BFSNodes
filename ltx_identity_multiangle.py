@@ -157,6 +157,19 @@ def _install_multi_patches(ltxv):
                 _dbg("prepare_timestep: already extended", cur)
             else:
                 _dbg("prepare_timestep: UNEXPECTED len", cur, "target", tgt_len, "ppf", ppf, "-> untouched")
+            # Guide nodes (IC-LoRA Guide / Director Guide, etc.) inject a grid_mask that
+            # FILTERS x tokens in _process_input (x = x[:, grid_mask]) and later indexes the
+            # timestep (timestep[:, grid_mask]). Our ref tokens are appended AFTER that
+            # filter, so extend the mask with True for them (False would drop our clean
+            # timesteps from the modulation and desync it from vx). Pad size is measured
+            # from the actual gap so per-token AND per-frame masks both work.
+            gm = kw.get("grid_mask")
+            if gm is not None and hasattr(gm, "shape") and timestep.dim() >= 2:
+                gap = timestep.shape[1] - gm.shape[-1]
+                if 0 < gap <= ref_len:
+                    pad = torch.ones(*gm.shape[:-1], gap, dtype=gm.dtype, device=gm.device)
+                    kw = dict(kw); kw["grid_mask"] = torch.cat([gm, pad], dim=-1)
+                    _dbg("prepare_timestep: grid_mask extended by", gap)
         return orig_prepare_ts(timestep, batch_size, hidden_dtype, **kw)
 
     def prepare_pe(self, pixel_coords, frame_rate, x_dtype):
