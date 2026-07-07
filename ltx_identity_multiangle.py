@@ -79,11 +79,20 @@ def _install_multi_patches(ltxv):
     orig_process_output = ltxv._process_output
 
     def process_input(self, x, keyframe_idxs, denoise_mask, **kw):
+        # Reset per-forward state FIRST so stale values from a previous run can never leak
+        # into this forward (e.g. if the ref latents stop reaching us after a Comfy update).
+        self._idma_ref_len = 0
+        self._idma_blocks = []
+        self._idma_target_len = None
+        self._idma_ppf = None
         out = orig_process_input(x, keyframe_idxs, denoise_mask, **kw)
+        # Comfy versions differ on whether custom transformer_options keys arrive flattened
+        # in kwargs or nested under kwargs["transformer_options"] — accept both.
         ref_lats = kw.get("_id_ref_latents")
+        if ref_lats is None:
+            ref_lats = (kw.get("transformer_options") or {}).get("_id_ref_latents")
         if not ref_lats:
-            self._id_ref_len = 0
-            self._id_ref_blocks = []
+            _dbg("process_input: NO ref latents in kwargs (flat or nested) -> vanilla forward. kw keys:", list(kw.keys()))
             return out
         from comfy.ldm.lightricks.model import latent_to_pixel_coords
         xx, pix, add = out
@@ -91,8 +100,8 @@ def _install_multi_patches(ltxv):
         vx = xx[0] if is_av else xx
         vco = pix[0] if is_av else pix
         target_len = vx.shape[1]
-        self._id_target_len = target_len
-        segs = getattr(self, "_id_ref_segs", [2.0] * len(ref_lats))
+        self._idma_target_len = target_len
+        segs = getattr(self, "_idma_segs", [2.0] * len(ref_lats))
         blocks = []
         offset = target_len
         for ref_lat, seg in zip(ref_lats, segs):
@@ -109,10 +118,12 @@ def _install_multi_patches(ltxv):
             vco = torch.cat([vco, rpc.to(vco)], dim=2)
             blocks.append((offset, rlen, float(seg)))
             offset += rlen
-        self._id_ref_len = offset - target_len
-        self._id_ref_blocks = blocks
-        add = dict(add); add["_id_ref_len"] = self._id_ref_len
-        _dbg("process_input OUT: blocks", blocks, "| target_len", target_len, "| total_ref", self._id_ref_len)
+        self._idma_ref_len = offset - target_len
+        self._idma_blocks = blocks
+        # each ref is one latent frame at the target grid -> its token count == tokens per frame
+        self._idma_ppf = blocks[0][1] if blocks else None
+        add = dict(add); add["_id_ref_len"] = self._idma_ref_len
+        _dbg("process_input OUT: blocks", blocks, "| target_len", target_len, "| total_ref", self._idma_ref_len)
         if is_av:
             xx = [vx, xx[1]]; pix = [vco, pix[1]]
         else:
@@ -120,19 +131,37 @@ def _install_multi_patches(ltxv):
         return xx, pix, add
 
     def prepare_timestep(self, timestep, batch_size, hidden_dtype, **kw):
-        ref_len = kw.get("_id_ref_len", getattr(self, "_id_ref_len", 0))
-        if ref_len:
-            target_len = getattr(self, "_id_target_len", None)
-            if timestep.dim() <= 1 and target_len is not None:
-                timestep = timestep.view(-1, 1).expand(batch_size, target_len).contiguous()
-            if timestep.dim() >= 2:
-                ref_ts = torch.zeros(batch_size, ref_len, *timestep.shape[2:], device=timestep.device, dtype=timestep.dtype)
-                timestep = torch.cat([timestep, ref_ts], dim=1)
+        # MEASURE-based extension: only pad the timestep by exactly what process_input
+        # actually appended in THIS forward, and detect the timestep granularity from its
+        # real length (per-token / per-frame / already-extended) instead of assuming one.
+        # This keeps modulation and vx in lockstep across ComfyUI versions.
+        ref_len = getattr(self, "_idma_ref_len", 0)
+        tgt_len = getattr(self, "_idma_target_len", None)
+        if ref_len and tgt_len:
+            ppf = getattr(self, "_idma_ppf", None)
+            if timestep.dim() <= 1:
+                timestep = timestep.reshape(-1, 1).expand(batch_size, tgt_len).contiguous()
+            cur = timestep.shape[1]
+            if cur == tgt_len:            # per-token, target only -> append per-token zeros
+                z = torch.zeros(timestep.shape[0], ref_len, *timestep.shape[2:],
+                                device=timestep.device, dtype=timestep.dtype)
+                timestep = torch.cat([timestep, z], dim=1)
+                _dbg("prepare_timestep: per-token extend", cur, "->", timestep.shape[1])
+            elif ppf and cur * ppf == tgt_len:   # per-FRAME timestep -> append ref frames
+                n_ref_frames = max(1, ref_len // ppf)
+                z = torch.zeros(timestep.shape[0], n_ref_frames, *timestep.shape[2:],
+                                device=timestep.device, dtype=timestep.dtype)
+                timestep = torch.cat([timestep, z], dim=1)
+                _dbg("prepare_timestep: per-frame extend", cur, "->", timestep.shape[1])
+            elif cur == tgt_len + ref_len:       # already extended (double-patch guard)
+                _dbg("prepare_timestep: already extended", cur)
+            else:
+                _dbg("prepare_timestep: UNEXPECTED len", cur, "target", tgt_len, "ppf", ppf, "-> untouched")
         return orig_prepare_ts(timestep, batch_size, hidden_dtype, **kw)
 
     def prepare_pe(self, pixel_coords, frame_rate, x_dtype):
         pe = orig_prepare_pe(pixel_coords, frame_rate, x_dtype)
-        blocks = getattr(self, "_id_ref_blocks", [])
+        blocks = getattr(self, "_idma_blocks", [])
         if not blocks:
             return pe
         theta = getattr(self, "_id_rope_theta", 10000.0)
@@ -151,7 +180,9 @@ def _install_multi_patches(ltxv):
         return pe
 
     def process_output(self, x, embedded_timestep, keyframe_idxs, **kw):
-        ref_len = kw.get("_id_ref_len", getattr(self, "_id_ref_len", 0))
+        ref_len = getattr(self, "_idma_ref_len", 0)
+        if ref_len:
+            _dbg("process_output: trimming", ref_len, "ref tokens")
         if ref_len:
             from comfy.ldm.lightricks.av_model import CompressedTimestep
             import copy
@@ -263,7 +294,7 @@ class LTXIdentityMultiAngle:
             used.append(f"{slot}(sid={_SLOT_SOURCE_ID[slot]:.0f})")
 
         _install_multi_patches(ltxv)
-        ltxv._id_ref_segs = segs
+        ltxv._idma_segs = segs
         ltxv._id_rope_theta = 10000.0
         m.model_options = dict(m.model_options)
         to = dict(m.model_options.get("transformer_options", {}))
